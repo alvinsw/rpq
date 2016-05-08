@@ -1,0 +1,19 @@
+{
+  "name": "rpq",
+  "version": "0.1.0",
+  "description": "Simple priority queue backed by redis",
+  "main": "index.js",
+  "repository": {
+    "type": "git",
+    "url": "https://github.com/alvinsw/rpq.git"
+  },
+  "keywords": [ "priority queue", "queue", "worker", "redis" ],
+  "author": {
+    "name": "Alvin Sebastian",
+    "email": "a.sebastian@connect.qut.edu.au"
+  },
+  "dependencies": {
+    "hiredis": "",
+    "redis": ""
+  }
+}
