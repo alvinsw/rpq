@@ -4,8 +4,9 @@
  * rpq:{qname}:priorities - sortedset
  * rpq:{qname}:queuedummy - list [1,1,1,1,1] This list is used to emulate blocking pop on multiple lists.
  * rpq:{qname}:queue:{priority} - list
- * rpq:{qname}:reserve:{reserveId} - string/int (eg job id or stringified JSON)
- *
+ * rpq:{qname}:reserves - set, containing the keys of reserveId lists below
+ * rpq:{qname}:reserve:{reserveId} - list of string/int (eg job id or stringified JSON)
+ * where {qname} is the name of the queue specified when instantiating the queue object.
  */
 
 "use strict";
@@ -32,20 +33,17 @@ var scripts = {};
 // x queue_n p1 p2 ... pn
 scripts.count = {
   src : `
-if #KEYS == 1 then
-  return redis.call('get', KEYS[1])
-else
-  local n = 0
-  for i = 2, #KEYS do
-    n = n + redis.call('llen', KEYS[i])
-  end
-  return n
+local n = 0
+for i = 1, #KEYS do
+  n = n + redis.call('llen', KEYS[i])
 end
+return n
 ` ,
-  sha : 'e41e3ffc43548a3a3a4a35469faf3d63d29ff9d2'
+  sha : ''
 };
 
 // x p1 p2 ... pn
+// KEYS[1..n] = rpq:name:queue:1..n
 scripts.peek = {
   src : `
 for i,v in ipairs(KEYS) do
@@ -53,10 +51,9 @@ for i,v in ipairs(KEYS) do
   if data then return data end
 end
 ` ,
-  sha : 'fed7e0d6e74675c569360bad350905165fad20aa'
+  sha : ''
 };
 
-// 1 priorities prefix
 scripts.peekAll = {
   src : `
 local p = redis.call('zrange', KEYS[1], 0, -1)
@@ -65,7 +62,7 @@ for i,v in ipairs(p) do
   if data then return data end
 end
 ` ,
-  sha : '0dd923a204ca56cb8d426b3e8b497f329535750d'
+  sha : ''
 };
 
 //script 4 priorities queue_n queuedummy queue:{priority}
@@ -78,34 +75,81 @@ local dn = redis.call('llen', KEYS[3])
 for i = 1, n - dn do redis.call('rpush', KEYS[3], '1') end
 return redis.call('rpush', KEYS[4], ARGV[1])
 ` ,
-  sha : 'e25db3d163f8ed468e2b91b7d290137a4c685c98'
+  sha : ''
 };
-//script 4 priorities queue_n queuedummy reserve prefix
+
+//KEYS[1] = queue_n
+//KEYS[2] = reserves
+//KEYS[3] = reserve:xxx
+//KEYS[4,..n] = queue:critical, queue:normal, ...
+//script n queue_n reserve_set_key [reserveKey] ..queuePrioritiesKey num_of_non_queue_keys
 scripts.dequeue = {
   src : `
-if KEYS[4] then
-  local data = redis.call('get', KEYS[4])
+for i = ARGV[1], #KEYS do
+  local data = redis.call('lpop', KEYS[i])
   if data then
-    redis.call('rpush', KEYS[3], '1')
-    return data
-  end
-end
-local p = redis.call('zrange', KEYS[1], 0, -1)
-for i,v in ipairs(p) do
-  local data = redis.call('lpop', ARGV[1] .. v)
-  if data then
-    redis.call('decr', KEYS[2])
-    if KEYS[4] then
-      redis.call('set', KEYS[4], data)
+    redis.call('decr', KEYS[1])
+    if tonumber(ARGV[1]) == 4 then
+      redis.call('sadd', KEYS[2], KEYS[3])
+      redis.call('rpush', KEYS[3], data)
     end
     return data
   end
 end
 return false
+
 ` ,
-  sha : '649ed6bdb74f03903eac5424c166adca2496d046'
+  sha : ''
 };
 
+scripts.handover = {
+  src : `
+  local data = redis.call('lpop', KEYS[2])
+  if data then
+    if redis.call('llen', KEYS[2]) == 0 then
+      redis.call('srem', KEYS[1], KEYS[2])
+    end
+    redis.call('rpush', KEYS[3], data)
+    redis.call('sadd', KEYS[1], KEYS[3])
+    return data
+  end
+` ,
+  sha : ''
+};
+
+scripts.ack = {
+  src : `
+  local data = redis.call('lpop', KEYS[2])
+  if data then
+    if redis.call('llen', KEYS[2]) == 0 then
+      redis.call('srem', KEYS[1], KEYS[2])
+    end
+    return data
+  end
+` ,
+  sha : ''
+};
+
+/**
+ * KEYS[1] = rpq:name:reserves
+ * KEYS[2], KEYS[3], ... KEYS[n] = rpq:name:reserve:1, rpq:name:reserve:2, ... rpq:name:reserve:n
+ */
+scripts.peekReserves = {
+  src : `
+local a = {}
+for i = 2, #KEYS do
+  local data = redis.call('lindex', KEYS[i], 0)
+  if data then
+    table.insert(a, data)
+  else
+    table.insert(a, '')
+    redis.call('srem', KEYS[1], KEYS[i])
+  end
+end
+return a
+` ,
+  sha : ''
+};
 
 class PriorityQueue extends EventEmitter {
   /**
@@ -117,6 +161,7 @@ class PriorityQueue extends EventEmitter {
    * @param {string} [options.name='default']
    * @param {Object} [options.priorities]
    * @param {string} [options.defaultPriority='normal']
+   * @param {string} [options.keyPrefix='rpq']
    * @api public
    */
   constructor(options) {
@@ -127,34 +172,75 @@ class PriorityQueue extends EventEmitter {
     self._errorCallback = function(err) {
       if (err) self.emit('error', err);
     };
+    /*
     var initScripts = function() {
       //console.log('connect');
+      var count = 0;
+      function done(){
+        --count;
+        if (count === 0) self.emit('ready');
+      }
       Object.keys(scripts).forEach(function(k) {
+        ++count;
         rc.script('exists', scripts[k].sha, function(err, results){
           if (err) self.emit('error', err);
-          if (!results[0]) rc.script('load', scripts[k].src, function(err, sha) {
-            scripts[k].sha = sha;
-            //console.log(err); console.log('%s %s', k, sha);
-          });
+          if (!results[0]) {
+            rc.script('load', scripts[k].src, function(err, sha) {
+              scripts[k].sha = sha;
+              done();
+              //console.log(err); console.log('%s %s', k, sha);
+            });
+          } else {
+            done();
+          }
         });
       });
     }
-    rc.on('error', self._errorCallback);
-    rc.on('connect', initScripts);
+    */
+    //rc.on('connect', initScripts);
     rc.on('ready', function(){ self.emit('ready'); });
+    rc.on('error', self._errorCallback);
     var name = p.name || 'default';
-    var rkeyPrefix = 'rpq:' + name + ':';
+    var prefix = p.keyPrefix || 'rpq';
+    var rkeyPrefix = prefix + ':' + name + ':';
     var rkeyPriorities = rkeyPrefix + 'priorities';
     var rkeyDummy = rkeyPrefix + 'queuedummy';
     var rkeyQueueCount = rkeyPrefix + 'queue_n';
+    var rkeyReserves = rkeyPrefix + 'reserves';
 
     Object.defineProperty(self, 'name', { value: name, enumerable:true });
     Object.defineProperty(self, '_rkeyPrefix', { value: rkeyPrefix });
-    Object.defineProperty(self, '_rkeyPriorities', { value: rkeyPriorities });
-    Object.defineProperty(self, '_rkeyDummy', { value: rkeyDummy });
-    Object.defineProperty(self, '_rkeyQueueCount', { value: rkeyQueueCount });
+    Object.defineProperty(self, '_rkeyPriorities', { value: rkeyPriorities }); // redis sorted set
+    Object.defineProperty(self, '_rkeyDummy', { value: rkeyDummy }); // redis list
+    Object.defineProperty(self, '_rkeyQueueCount', { value: rkeyQueueCount }); // redis int
+    Object.defineProperty(self, '_rkeyReserves', { value: rkeyReserves }); // redis list
     self.setPriorities((p.priorities || DEFAULT_PRIORITIES), self._errorCallback);
     self.defaultPriority = p.defaultPriority || 'normal';
+  }
+
+  _rcevalsha(script, keys, args, cb) {
+    var rc = this._rc;
+    var params = [script.sha, keys.length];
+    keys.forEach((v)=>params.push(v));
+    args.forEach((v)=>params.push(v));
+    if (script.sha) {
+      rc.evalsha(params, function(err, result){
+        if (err && err.code === 'NOSCRIPT') {
+          load();
+        } else {
+          cb(err, result);
+        }
+      });
+    } else {
+      load();
+    }
+    function load(){
+      rc.script('load', script.src, function(err, sha) {
+        if (err) return cb(err);
+        script.sha = params[0] = sha;
+        rc.evalsha(params, cb);
+      });
+    }
   }
 
   _rkeyQueue(priorityKey) {
@@ -162,6 +248,24 @@ class PriorityQueue extends EventEmitter {
   }
   _rkeyReserve(reserveId) {
     return this._rkeyPrefix + 'reserve:' + reserveId;
+  }
+
+  /* pvs is list of priorities */
+  _priorityKeys(priorities_, cb_) {
+    var priorities;
+    var cb = cb_;
+    if (!cb) {
+      cb = priorities_;
+    } else {
+      priorities = priorities_;
+    }
+    var self = this;
+    self._rc.zrange(self._rkeyPriorities, 0, -1, (err, epriorities) => {
+      cb(err, epriorities.reduce( (arr, p) => {
+        if (!priorities || priorities.indexOf(p) >= 0) arr.push( self._rkeyQueue(p) );
+        return arr;
+      }, []));
+    });
   }
 
   setPriorities(priorities, cb_) {
@@ -178,6 +282,7 @@ class PriorityQueue extends EventEmitter {
   getPriorities() {
     return this._priorities;
   }
+  /*
   getPriorityKeys(priorities) {
     var p = this._priorities;
     if (Array.isArray(priorities) && priorities.length > 0) {
@@ -188,6 +293,8 @@ class PriorityQueue extends EventEmitter {
     }
     return Object.keys(p).sort( (a,b) => (p[a] - p[b]) ).map( (k) => (this._rkeyQueue(k)) );
   }
+  */
+
   getOnlinePriorities(cb_) {
     var cb = cb_ || this._errorCallback;
     this._rc.zrange([this._rkeyPriorities, 0, -1, 'WITHSCORES'], function(err, result) {
@@ -215,7 +322,10 @@ class PriorityQueue extends EventEmitter {
   }
 
   quit() {
-    this._rc.quit();
+    if (this._rc.connected) this._rc.quit();
+  }
+  end() {
+    this._rc.end(true);
   }
 
   /**
@@ -234,49 +344,51 @@ class PriorityQueue extends EventEmitter {
     }
     var self = this;
     if (typeof this._priorities[priority] !== 'number') return cb(new Error('priority not found'));
-    self._rc.evalsha(scripts.enqueue.sha, 4, self._rkeyPriorities, self._rkeyQueueCount, self._rkeyDummy, self._rkeyQueue(priority), data, cb);
+    //self._rc.evalsha(scripts.enqueue.sha, 4, self._rkeyPriorities, self._rkeyQueueCount, self._rkeyDummy, self._rkeyQueue(priority), data, cb);
+    self._rcevalsha(scripts.enqueue, [self._rkeyPriorities, self._rkeyQueueCount, self._rkeyDummy, self._rkeyQueue(priority)], [data], cb);
   }
 
   /**
    * @param {Object}  [options]
    * @param {integer} [options.timeout=0] - maximum number of seconds to block, 0 means block indefinitely
    * @param {string}  [options.reserve] - An id of the client which consumed the queued item.
-   * If specified, the taken item will be reserved by the particular id and must be confirmed.
+   * If specified, the taken item will be reserved by the particular id and must be acknowledged.
    * TODO: Dequeue from specified priorities only
    */
   dequeue(options_, cb_) {
     var self = this;
-    var rc = this._rc;
+    //var rc = this._rc;
     var options = typeof options_ === "object" ? options_ : {};
     var cb = (typeof options_ === 'function') ? options_ : (cb_ || this._errorCallback);
-
+    var done = cb;
     var timeout = options.timeout || 0;
-    var reserveKey = typeof options.reserve === 'string' ? self._rkeyReserve(options.reserve) : undefined;
-    var tryblocking = function(after) {
-      rc.blpop(self._rkeyDummy, timeout, function(err, result){
-        if (err || !result) return cb(err);
-        after();
-      });
-    };
-    if (reserveKey) {
-      var done = function(cb) {
+
+    var params = [self._rkeyQueueCount];
+    if (options.reserve) {
+      let reserveKey = self._rkeyReserve(options.reserve);
+      params.push(self._rkeyReserves, reserveKey);
+      done = function(err, result) {
         // confirm that a job has been consumed successfully
-        rc.del(reserveKey, cb);
+        cb(err, result, (cb) => self._ack(reserveKey, cb));
       };
-      // always check if a previously reserved item is still available
-      rc.get(reserveKey, function(err, item) {
+//      rc.evalsha(scripts.peek.sha, 1, reserveKey, (err, data) => {
+      self._rcevalsha(scripts.peek, [reserveKey], [], (err, data) => {
         if (err) return cb(err);
-        if (item != null) {
-          return cb(null, item, done);
-        } else {
-          tryblocking(function(){
-            rc.evalsha(scripts.dequeue.sha, 4, self._rkeyPriorities, self._rkeyQueueCount, self._rkeyDummy, reserveKey, self._rkeyPrefix + 'queue:', (err, result) => cb(err, result, done));
-          });
-        }
+        if (data) return done(err, data);
+        else return run();
       });
     } else {
-      tryblocking(function(){
-        rc.evalsha(scripts.dequeue.sha, 3, self._rkeyPriorities, self._rkeyQueueCount, self._rkeyDummy, self._rkeyPrefix + 'queue:', cb);
+      run();
+    }
+
+    function run() {
+      self._rc.blpop(self._rkeyDummy, timeout, function(err, result){
+        if (err || !result) return cb(err);
+        self._priorityKeys(function(err, keys){
+          if (err || !keys || keys.length === 0) return cb(err);
+          //rc.evalsha(scripts.dequeue.sha, params.length + keys.length, ...params, ...keys, params.length + 1, done);
+          self._rcevalsha(scripts.dequeue, [...params, ...keys], [params.length + 1], done);
+        });
       });
     }
     return this;
@@ -293,15 +405,50 @@ class PriorityQueue extends EventEmitter {
     var priorities, cb = cb_ || this._errorCallback;
     if (typeof priorities_ === 'string') priorities = [priorities_];
     else if (typeof priorities_ === 'function') cb = priorities_;
-    else priorities = priorities_;
-    var params = [scripts.count.sha];
-    if (priorities && priorities.length) {
-      let pkeys = self.getPriorityKeys(priorities);
-      params.push(pkeys.length + 1, self._rkeyQueueCount, ...pkeys);
-    } else {
-      params.push(1, self._rkeyQueueCount);
+    else if (Array.isArray(priorities_) && priorities_.length) priorities = priorities_;
+    var done = function(err1, result){
+      var count, err;
+      if (!err1) {
+        try {
+          count = parseInt(result);
+        } catch (err2) {
+           err = err2;
+        }
+      }
+      cb(err, count);
     }
-    self._rc.evalsha(params, cb);
+    if (priorities) {
+      self._priorityKeys(priorities, (err, keys) => {
+        //self._rc.evalsha(scripts.count.sha, keys.length, ...keys, done);
+        self._rcevalsha(scripts.count, keys, [], done);
+      });
+    } else {
+      self._rc.get(self._rkeyQueueCount, done);
+    }
+  }
+
+  /** Removes all items contained in this queue. This will delete all data associated with the named rpq in redis. */
+  clear(cb_) {
+    var cb = cb_ || this._errorCallback;
+    var self = this;
+    var n = 0;
+    var lastErr;
+    var done = function(err){
+      if (err) lastErr = err;
+      ++n;
+      if (n === 2) {
+        if (lastErr) return cb(lastErr);
+        else self._rc.del(self._rkeyReserves, self._rkeyDummy, self._rkeyQueueCount, cb);
+      }
+    }
+    self._rc.smembers(self._rkeyReserves, (err, rkeys) => {
+      if (rkeys.length) self._rc.del(rkeys, done);
+      else done(err);
+    });
+    self._priorityKeys((err, pkeys) => {
+      if (pkeys.length) self._rc.del(pkeys, done);
+      else done(err);
+    });
   }
 
   /**
@@ -312,46 +459,70 @@ class PriorityQueue extends EventEmitter {
    */
   peek(priorities_, cb_) {
     var self = this;
-    var priorities, cb = cb_ || this._errorCallback;
-    if (typeof priorities_ === 'string') priorities = [priorities_];
-    else if (typeof priorities_ === 'function') cb = priorities_;
-    else priorities = priorities_;
-
-    var pkeys = self.getPriorityKeys(priorities);
+    var priorities, cb;
+    if (typeof priorities_ === 'function') {
+      if (!cb_) cb = priorities_;
+    } else if (typeof priorities_ === 'string') {
+      priorities = [priorities_];
+    } else if (Array.isArray(priorities_) && priorities_.length > 0) {
+      priorities = priorities_;
+    }
+    cb = cb || cb_ || this._errorCallback;
+//    if (priorities) {
+//      pvs = priorities.map((p)=>(self._priorities[p] || p));
+//    }
+    //var pkeys = self.getPriorityKeys(priorities);
     //console.log(pkeys);
-    self._rc.evalsha(scripts.peek.sha, pkeys.length, ...pkeys, cb);
-    /*
-    self._rc.zrange([self._rkeyPriorities, 0, -1], function(err, result) {
-      if (!err && result && result.length > 0) {
-        if (priorities.length === 0) {
-          priorities = result;
-        } else {
-          let ps = new Set(result);
-          priorities = priorities.filter(p => ps.has(p));
-        }
+    self._priorityKeys(priorities, function(err, keys) {
+      if (err || !keys || keys.length === 0) return cb(err);
+      //self._rc.evalsha(scripts.peek.sha, keys.length, ...keys, cb);
+      self._rcevalsha(scripts.peek, keys, [], cb);
 
-        let multi = self._rc.multi();
-        for (let p of priorities) {
-          multi.lindex(self._rkeyQueue(p), 0);
-        }
-        multi.exec(function(err, items) {
-          //  console.log(items);
-          var item;
-          if (items) {
-            for (let i of items) {
-              if (i != null) {
-                item = i;
-                break;
-              }
-            }
-          }
-          cb(err, item);
-        });
-      } else {
-        cb(err, null);
-      }
     });
-    */
-    //return this;
+    return this;
+  }
+
+  /**
+   * Hand over a reserved item to other client
+   * return the handed over item
+   */
+  handover(from, to, cb_){
+    var cb = cb_ || this._errorCallback;
+    var reserveKeyFrom = this._rkeyReserve(from);
+    var reserveKeyTo = this._rkeyReserve(to);
+    //this._rc.evalsha(scripts.handover.sha, 3, this._rkeyReserves, reserveKeyFrom, reserveKeyTo, cb);
+    this._rcevalsha(scripts.handover, [this._rkeyReserves, reserveKeyFrom, reserveKeyTo], [], cb);
+
+    return this;
+  }
+
+  _ack(reserveKey, cb) {
+    //this._rc.evalsha(scripts.ack.sha, 2, this._rkeyReserves, reserveKey, cb);
+    this._rcevalsha(scripts.ack, [this._rkeyReserves, reserveKey], [], cb);
+  }
+
+  acknowledge(reserve, cb_) {
+    if (!reserve) return;
+    var cb = cb_ || this._errorCallback;
+    this._ack(this._rkeyReserve(reserve), cb);
+    return this;
+  }
+
+  /** Peek the first entry of each reserve associated with a unique client
+   */
+  peekReserves(cb) {
+    var self = this;
+    var done = cb || this._errorCallback;
+
+    self._rc.smembers(self._rkeyReserves, function(err, keys){
+      if (err) return done(err);
+      //self._rc.evalsha(scripts.peekReserves.sha, keys.length + 1, self._rkeyReserves, ...keys, function(err, data){
+      self._rcevalsha(scripts.peekReserves, [self._rkeyReserves, ...keys], [], function(err, data){
+        if (err) return done(err);
+        var pos = self._rkeyReserve('').length;
+        var result = data.map( (v, i) => [keys[i].slice(pos), v] );
+        return done(null, result);
+      });
+    });
   }
 }

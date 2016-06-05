@@ -3,6 +3,9 @@
   "version": "0.1.0",
   "description": "Simple priority queue backed by redis",
   "main": "index.js",
+  "scripts": {
+    "test": "mocha"
+  },
   "repository": {
     "type": "git",
     "url": "https://github.com/alvinsw/rpq.git"
