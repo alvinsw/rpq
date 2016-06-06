@@ -16,7 +16,7 @@
     "email": "a.sebastian@connect.qut.edu.au"
   },
   "dependencies": {
-    "hiredis": "",
-    "redis": ""
+    "hiredis": "0.4.*",
+    "redis": "2.6.*"
   }
 }
